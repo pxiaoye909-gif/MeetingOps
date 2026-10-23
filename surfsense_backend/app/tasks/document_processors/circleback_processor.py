@@ -26,7 +26,6 @@ from app.db import (
     Workspace,
 )
 from app.utils.document_converters import (
-    create_document_chunks,
     embed_text,
     generate_content_hash,
     generate_unique_identifier_hash,
@@ -37,6 +36,7 @@ from .base import (
     get_current_timestamp,
     safe_set_chunks,
 )
+from .circleback_chunking import create_circleback_document_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +179,7 @@ async def add_circleback_meeting_document(
         summary_embedding = embed_text(summary_content)
 
         # Process chunks
-        chunks = await create_document_chunks(markdown_content)
+        chunks = await create_circleback_document_chunks(markdown_content)
 
         # No BlockNote conversion needed — store raw markdown for Plate.js editor
 

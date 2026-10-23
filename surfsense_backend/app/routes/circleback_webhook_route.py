@@ -202,10 +202,16 @@ def format_circleback_meeting_to_markdown(payload: CirclebackWebhookPayload) -> 
         lines.append("## Transcript")
         lines.append("")
         for segment in payload.transcript:
-            # Format timestamp as MM:SS
-            minutes = int(segment.timestamp // 60)
-            seconds = int(segment.timestamp % 60)
-            timestamp_str = f"[{minutes:02d}:{seconds:02d}]"
+            total_seconds = int(segment.timestamp)
+
+            if total_seconds >= 3600:
+                hours, remainder = divmod(total_seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                timestamp_str = f"[{hours:02d}:{minutes:02d}:{seconds:02d}]"
+            else:
+                minutes, seconds = divmod(total_seconds, 60)
+                timestamp_str = f"[{minutes:02d}:{seconds:02d}]"
+
             lines.append(f"**{segment.speaker}** {timestamp_str}: {segment.text}")
             lines.append("")
 

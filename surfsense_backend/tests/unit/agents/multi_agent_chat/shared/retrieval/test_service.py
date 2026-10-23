@@ -67,3 +67,33 @@ def test_reranker_reorders_documents_before_labeling() -> None:
     # Reversed: doc 2 now renders first and gets [1].
     assert registry.resolve(1).locator == {"document_id": 2, "chunk_id": 12}
     assert registry.resolve(2).locator == {"document_id": 1, "chunk_id": 880}
+
+
+def test_circleback_evidence_preserves_speaker_and_timestamp() -> None:
+    registry = CitationRegistry()
+    utterance = "**Alice** [01:23]: We should delay the release."
+
+    hit = DocumentHit(
+        document_id=42,
+        title="Release Planning",
+        document_type="CIRCLEBACK",
+        metadata={"CIRCLEBACK_MEETING_ID": 101},
+        score=0.9,
+        chunks=[
+            ChunkHit(
+                chunk_id=880,
+                content=utterance,
+                position=0,
+                score=0.9,
+            )
+        ],
+    )
+
+    context = build_context("Why was the release delayed?", [hit], registry)
+
+    assert context is not None
+    assert utterance in context
+
+    citation = registry.resolve(1)
+    assert citation is not None
+    assert citation.locator == {"document_id": 42, "chunk_id": 880}

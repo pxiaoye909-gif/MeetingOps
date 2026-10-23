@@ -25,6 +25,7 @@ from app.indexing_pipeline.cache.cached_indexing import (
     embed_batch,
 )
 from app.indexing_pipeline.chunk_reconciler import ExistingChunk, reconcile
+from app.indexing_pipeline.circleback_evidence import circleback_chunks_with_lines
 from app.indexing_pipeline.connector_document import ConnectorDocument
 from app.indexing_pipeline.document_hashing import (
     compute_content_hash,
@@ -561,6 +562,29 @@ class IndexingPipelineService:
             delete(Chunk).where(Chunk.document_id == document.id)
         )
 
+        if document.document_type == DocumentType.CIRCLEBACK:
+            line_chunks = await asyncio.to_thread(circleback_chunks_with_lines, content)
+            embeddings = await embed_batch(
+                [content, *[part.text for part in line_chunks]]
+            )
+
+            if len(embeddings) != len(line_chunks) + 1:
+                raise ValueError("Circleback embedding count mismatch")
+
+            document.embedding = embeddings[0]
+            return [
+                Chunk(
+                    content=part.text,
+                    embedding=embedding,
+                    position=i,
+                    start_line=part.start_line,
+                    end_line=part.end_line,
+                )
+                for i, (part, embedding) in enumerate(
+                    zip(line_chunks, embeddings[1:], strict=True)
+                )
+            ]
+
         summary_embedding, embedded_chunks = await build_chunk_embeddings(
             content,
             use_code_chunker=connector_doc.should_use_code_chunker,
@@ -590,9 +614,14 @@ class IndexingPipelineService:
         Unchanged rows keep their embedding and their HNSW/GIN index entries;
         moved rows get a position-only UPDATE, which touches neither index.
         """
-        new_chunks = await chunk_markdown_with_lines(
-            content, use_code_chunker=connector_doc.should_use_code_chunker
-        )
+        if document.document_type == DocumentType.CIRCLEBACK:
+            new_chunks = await asyncio.to_thread(circleback_chunks_with_lines, content)
+        else:
+            new_chunks = await chunk_markdown_with_lines(
+                content,
+                use_code_chunker=connector_doc.should_use_code_chunker,
+            )
+
         plan = reconcile(existing, new_chunks)
 
         # One batch: the document-level summary vector plus the missing chunks.
