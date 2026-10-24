@@ -5,16 +5,23 @@ This module provides a webhook endpoint for receiving meeting data from Circleba
 It processes the incoming webhook payload and saves it as a document in the specified workspace.
 """
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import SearchSourceConnector, SearchSourceConnectorType, get_async_session
+from app.routes.circleback_webhook_auth import verify_circleback_signature
+from app.routes.circleback_webhook_idempotency import (
+    DeliveryStoreUnavailableError,
+    claim_circleback_delivery,
+    release_circleback_delivery,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +78,16 @@ class CirclebackWebhookPayload(BaseModel):
 
     model_config = {"populate_by_name": True}
 
-    id: int = Field(..., description="Circleback meeting ID")
+    id: str = Field(..., description="Circleback meeting ID")
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def normalize_meeting_id(cls, value: object) -> object:
+        """Accept legacy numeric IDs while storing a canonical string."""
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+        return value
+
     name: str = Field(..., description="Meeting name")
     created_at: str = Field(
         ..., alias="createdAt", description="Meeting creation date in ISO format"
@@ -222,6 +238,7 @@ def format_circleback_meeting_to_markdown(payload: CirclebackWebhookPayload) -> 
 async def receive_circleback_webhook(
     workspace_id: int,
     payload: CirclebackWebhookPayload,
+    request: Request,
     session: AsyncSession = Depends(get_async_session),
 ):
     """
@@ -243,7 +260,36 @@ async def receive_circleback_webhook(
         This endpoint does not require authentication as it's designed to receive
         webhooks from Circleback. Signature verification can be added later for security.
     """
+    claim_token: str | None = None
+    enqueued = False
+
     try:
+        raw_body = await request.body()
+        signature = request.headers.get("x-signature")
+
+        if not verify_circleback_signature(workspace_id, raw_body, signature):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid webhook signature",
+            )
+
+        try:
+            claim_token = await asyncio.to_thread(
+                claim_circleback_delivery, workspace_id, raw_body
+            )
+        except DeliveryStoreUnavailableError:
+            raise HTTPException(
+                status_code=503,
+                detail="Webhook delivery temporarily unavailable",
+            ) from None
+
+        if claim_token is None:
+            return {
+                "status": "duplicate",
+                "meeting_id": payload.id,
+                "workspace_id": workspace_id,
+            }
+
         logger.info(
             f"Received Circleback webhook for meeting {payload.id} in workspace {workspace_id}"
         )
@@ -299,6 +345,8 @@ async def receive_circleback_webhook(
             connector_id=connector_id,
         )
 
+        enqueued = True
+
         logger.info(
             f"Queued Circleback meeting {payload.id} for processing in workspace {workspace_id}"
         )
@@ -310,12 +358,28 @@ async def receive_circleback_webhook(
             "workspace_id": workspace_id,
         }
 
-    except Exception as e:
-        logger.error(f"Error processing Circleback webhook: {e!s}", exc_info=True)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            "Circleback webhook processing failed for workspace %s",
+            workspace_id,
+        )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to process Circleback webhook: {e!s}",
-        ) from e
+            detail="Internal webhook processing error",
+        ) from None
+    finally:
+        if claim_token is not None and not enqueued:
+            try:
+                await asyncio.to_thread(
+                    release_circleback_delivery,
+                    workspace_id,
+                    raw_body,
+                    claim_token,
+                )
+            except DeliveryStoreUnavailableError:
+                logger.warning("Could not release Circleback delivery claim")
 
 
 @router.get("/webhooks/circleback/{workspace_id}/info")

@@ -37,3 +37,18 @@ def test_long_meeting_timestamp_includes_hours() -> None:
     markdown = _meeting_markdown(3600.0)
 
     assert "**Alice** [01:00:00]: We should delay the release." in markdown
+
+
+def test_circleback_accepts_official_string_meeting_id() -> None:
+    """Circleback documents string meeting IDs."""
+    meeting_id = "WRweb12iCBimU6Vo8cD7z"
+
+    payload = CirclebackWebhookPayload(
+        id=meeting_id,
+        name="Event Venue Review",
+        createdAt="2026-10-24T10:00:00Z",
+        duration=600,
+    )
+
+    assert payload.id == meeting_id
+    assert meeting_id in format_circleback_meeting_to_markdown(payload)

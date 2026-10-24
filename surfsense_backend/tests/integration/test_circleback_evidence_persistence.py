@@ -146,7 +146,7 @@ async def test_circleback_update_replaces_stale_chunks(
     async def save(markdown):
         return await circleback_processor.add_circleback_meeting_document(
             session=db_session,
-            meeting_id=987655,
+            meeting_id="WRweb12iCBimU6Vo8cD7z",
             meeting_name="Release Meeting",
             markdown_content=markdown,
             metadata={},
@@ -158,6 +158,11 @@ async def test_circleback_update_replaces_stale_chunks(
     assert first is not None
 
     document_id = first.id
+
+    # Same Circleback ID and unchanged content must reuse the document.
+    unchanged = await save(original)
+    assert unchanged is not None
+    assert unchanged.id == document_id
 
     old_rows = (
         (
@@ -181,6 +186,20 @@ async def test_circleback_update_replaces_stale_chunks(
 
     saved_document = await db_session.get(Document, document_id)
     assert saved_document.source_markdown == updated
+    assert (
+        saved_document.document_metadata["CIRCLEBACK_MEETING_ID"]
+        == "WRweb12iCBimU6Vo8cD7z"
+    )
+
+    matches = (
+        await db_session.execute(
+            select(Document).where(
+                Document.unique_identifier_hash
+                == saved_document.unique_identifier_hash
+            )
+        )
+    ).scalars().all()
+    assert len(matches) == 1
 
     new_rows = (
         (

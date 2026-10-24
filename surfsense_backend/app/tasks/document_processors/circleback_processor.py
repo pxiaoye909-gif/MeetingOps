@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 async def add_circleback_meeting_document(
     session: AsyncSession,
-    meeting_id: int,
+    meeting_id: str,
     meeting_name: str,
     markdown_content: str,
     metadata: dict[str, Any],

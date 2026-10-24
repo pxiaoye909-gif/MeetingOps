@@ -1062,7 +1062,7 @@ async def _process_file_with_document(
 @celery_app.task(name="process_circleback_meeting", bind=True)
 def process_circleback_meeting_task(
     self,
-    meeting_id: int,
+    meeting_id: str,
     meeting_name: str,
     markdown_content: str,
     metadata: dict,
@@ -1093,7 +1093,7 @@ def process_circleback_meeting_task(
 
 
 async def _process_circleback_meeting(
-    meeting_id: int,
+    meeting_id: str,
     meeting_name: str,
     markdown_content: str,
     metadata: dict,
