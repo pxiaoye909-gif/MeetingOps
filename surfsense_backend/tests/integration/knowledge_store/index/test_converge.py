@@ -686,3 +686,725 @@ async def test_a_failing_document_does_not_discard_its_batch(
         select(func.count(Chunk.id)).where(Chunk.document_id == good.id)
     )
     assert chunk_count and chunk_count > 0
+
+
+async def test_circleback_type_survives_rebuild_after_row_loss(
+    store,
+    db_session,
+    db_workspace,
+    db_user,
+    workspace_flip,
+    patched_embed_texts,
+):
+    """Restore Circleback identity when its PostgreSQL row is lost."""
+    from app.knowledge_store.service import record_prepared_documents
+
+    workspace_flip(True)
+
+    meeting_id = "WRweb12iCBimU6Vo8cD7z"
+    markdown = "# Release Review\\n\\n**Alice** [00:03]: Approved.\\n"
+
+    original = Document(
+        title="Release Review",
+        document_type=DocumentType.CIRCLEBACK,
+        document_metadata={
+            "CIRCLEBACK_MEETING_ID": meeting_id,
+            "SOURCE": "CIRCLEBACK_WEBHOOK",
+        },
+        content=markdown,
+        source_markdown=markdown,
+        content_hash=f"test-{uuid.uuid4().hex}",
+        unique_identifier_hash=generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        ),
+        workspace_id=db_workspace.id,
+        created_by_id=db_user.id,
+        status=DocumentStatus.ready(),
+    )
+
+    db_session.add(original)
+    await db_session.commit()
+
+    revision = await record_prepared_documents(db_session, [original])
+    assert revision is not None
+
+    original_path = original.path
+    assert original_path is not None
+
+    # Simulate loss of the database row without deleting the Git file.
+    await db_session.delete(original)
+    await db_session.commit()
+
+    await index_tree(db_session, db_workspace.id)
+
+    restored = await db_session.scalar(
+        select(Document).where(
+            Document.workspace_id == db_workspace.id,
+            Document.path == original_path,
+        )
+    )
+
+    assert restored is not None
+    assert restored.document_type == DocumentType.CIRCLEBACK
+    assert restored.document_metadata["CIRCLEBACK_MEETING_ID"] == meeting_id
+
+
+async def test_circleback_ingest_commits_markdown_and_identity_together(
+    store, db_session, db_workspace, db_user, workspace_flip
+):
+    """Circleback content and identity must share a Git revision."""
+    from app.knowledge_store.circleback_identity import (
+        decode_identity,
+        identity_path,
+    )
+    from app.knowledge_store.paths import to_store_path
+    from app.knowledge_store.service import record_prepared_documents
+
+    workspace_flip(True)
+
+    meeting_id = "WRweb12iCBimU6Vo8cD7z"
+    markdown = "# Release Review\n\n**Alice** [00:03]: Approved.\n"
+
+    document = Document(
+        title="Release Review",
+        document_type=DocumentType.CIRCLEBACK,
+        document_metadata={"CIRCLEBACK_MEETING_ID": meeting_id},
+        content=markdown,
+        source_markdown=markdown,
+        content_hash=f"test-{uuid.uuid4().hex}",
+        unique_identifier_hash=generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        ),
+        workspace_id=db_workspace.id,
+        created_by_id=db_user.id,
+        status=DocumentStatus.ready(),
+    )
+
+    db_session.add(document)
+    await db_session.commit()
+
+    revision = await record_prepared_documents(db_session, [document])
+    assert revision is not None
+    assert document.path is not None
+
+    markdown_path = to_store_path(document.path)
+    metadata_path = identity_path(document.path)
+
+    tracked = {entry.path for entry in await store.list_paths(revision)}
+    assert markdown_path in tracked
+    assert metadata_path in tracked
+
+    saved_markdown = await store.read_as_of(revision, markdown_path)
+    saved_identity = await store.read_as_of(revision, metadata_path)
+
+    assert saved_markdown.decode() == markdown
+    assert decode_identity(
+        saved_identity,
+        virtual_path=document.path,
+        markdown=markdown,
+    ) == {
+        "CIRCLEBACK_MEETING_ID": meeting_id,
+        "SOURCE": "CIRCLEBACK_WEBHOOK",
+    }
+
+
+async def test_deleting_circleback_removes_its_git_identity(
+    store, db_session, db_workspace, db_user, workspace_flip
+):
+    """Deleting a meeting must remove both content and identity."""
+    from app.knowledge_store.circleback_identity import identity_path
+    from app.knowledge_store.paths import to_store_path
+    from app.knowledge_store.service import (
+        record_deleted_documents,
+        record_prepared_documents,
+    )
+
+    workspace_flip(True)
+    meeting_id = "delete-test-meeting-001"
+    markdown = "# Deletion test\n\n**Alice** [00:03]: Done.\n"
+
+    document = Document(
+        title="Deletion test",
+        document_type=DocumentType.CIRCLEBACK,
+        document_metadata={"CIRCLEBACK_MEETING_ID": meeting_id},
+        content=markdown,
+        source_markdown=markdown,
+        content_hash=f"test-{uuid.uuid4().hex}",
+        unique_identifier_hash=generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        ),
+        workspace_id=db_workspace.id,
+        created_by_id=db_user.id,
+        status=DocumentStatus.ready(),
+    )
+
+    db_session.add(document)
+    await db_session.commit()
+
+    created_revision = await record_prepared_documents(db_session, [document])
+    assert created_revision is not None
+    assert document.path is not None
+
+    markdown_path = to_store_path(document.path)
+    metadata_path = identity_path(document.path)
+
+    before = {entry.path for entry in await store.list_paths(created_revision)}
+    assert markdown_path in before
+    assert metadata_path in before
+
+    deleted_revision = await record_deleted_documents(db_session, [document])
+    assert deleted_revision is not None
+
+    after = {entry.path for entry in await store.list_paths(deleted_revision)}
+
+    assert markdown_path not in after
+    assert metadata_path not in after
+
+
+async def test_moving_circleback_relocates_git_identity(
+    store, db_session, db_workspace, db_user, workspace_flip
+):
+    """A meeting rename must relocate its matching Git identity."""
+    from app.knowledge_store.circleback_identity import (
+        decode_identity,
+        identity_path,
+    )
+    from app.knowledge_store.paths import to_store_path
+    from app.knowledge_store.service import (
+        record_moved_documents,
+        record_prepared_documents,
+    )
+
+    workspace_flip(True)
+    meeting_id = "move-test-meeting-001"
+    markdown = "# Release Review\\n\\n**Alice** [00:03]: Approved.\\n"
+
+    document = Document(
+        title="Release Review",
+        document_type=DocumentType.CIRCLEBACK,
+        document_metadata={"CIRCLEBACK_MEETING_ID": meeting_id},
+        content=markdown,
+        source_markdown=markdown,
+        content_hash=f"test-{uuid.uuid4().hex}",
+        unique_identifier_hash=generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        ),
+        workspace_id=db_workspace.id,
+        created_by_id=db_user.id,
+        status=DocumentStatus.ready(),
+    )
+
+    db_session.add(document)
+    await db_session.commit()
+
+    original_revision = await record_prepared_documents(db_session, [document])
+    assert original_revision is not None
+
+    old_path = document.path
+    assert old_path is not None
+    old_identity_path = identity_path(old_path)
+
+    document.title = "Release Review Final"
+    revision = await record_moved_documents(db_session, [document])
+
+    assert revision is not None
+    new_path = document.path
+    assert new_path is not None
+    assert new_path != old_path
+
+    new_identity_path = identity_path(new_path)
+
+    tracked = {entry.path for entry in await store.list_paths(revision)}
+
+    assert to_store_path(old_path) not in tracked
+    assert to_store_path(new_path) in tracked
+
+    assert old_identity_path not in tracked
+    assert new_identity_path in tracked
+
+    saved_markdown = await store.read_as_of(revision, to_store_path(new_path))
+    saved_identity = await store.read_as_of(revision, new_identity_path)
+
+    assert saved_markdown.decode() == markdown
+    assert decode_identity(
+        saved_identity,
+        virtual_path=new_path,
+        markdown=markdown,
+    ) == {
+        "CIRCLEBACK_MEETING_ID": meeting_id,
+        "SOURCE": "CIRCLEBACK_WEBHOOK",
+    }
+
+
+async def test_editor_retitle_updates_circleback_git_identity(
+    store, db_session, db_workspace, db_user, workspace_flip
+):
+    """Editor rename and content change must refresh Circleback identity."""
+    from app.knowledge_store.circleback_identity import (
+        decode_identity,
+        identity_path,
+    )
+    from app.knowledge_store.paths import to_store_path
+    from app.knowledge_store.service import (
+        record_prepared_documents,
+        record_saved_document,
+    )
+
+    workspace_flip(True)
+
+    meeting_id = "editor-test-meeting-001"
+    original = "# Release Review\\n\\n**Alice** [00:03]: Draft.\\n"
+    updated = "# Release Review Final\\n\\n**Alice** [00:03]: Approved.\\n"
+
+    document = Document(
+        title="Release Review",
+        document_type=DocumentType.CIRCLEBACK,
+        document_metadata={"CIRCLEBACK_MEETING_ID": meeting_id},
+        content=original,
+        source_markdown=original,
+        content_hash=f"test-{uuid.uuid4().hex}",
+        unique_identifier_hash=generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        ),
+        workspace_id=db_workspace.id,
+        created_by_id=db_user.id,
+        status=DocumentStatus.ready(),
+    )
+
+    db_session.add(document)
+    await db_session.commit()
+
+    first_revision = await record_prepared_documents(db_session, [document])
+    assert first_revision is not None
+
+    old_path = document.path
+    assert old_path is not None
+
+    document.title = "Release Review Final"
+    revision = await record_saved_document(
+        db_session,
+        workspace_id=db_workspace.id,
+        doc_id=document.id,
+        title="Release Review Final",
+        folder_id=document.folder_id,
+        markdown=updated,
+        author_user_id=str(db_user.id),
+        title_is_explicit=True,
+    )
+    assert revision is not None
+
+    new_path = document.path
+    assert new_path is not None
+    assert new_path != old_path
+
+    tracked = {entry.path for entry in await store.list_paths(revision)}
+
+    assert to_store_path(old_path) not in tracked
+    assert to_store_path(new_path) in tracked
+    assert identity_path(old_path) not in tracked
+    assert identity_path(new_path) in tracked
+
+    saved = await store.read_as_of(revision, to_store_path(new_path))
+    assert saved.decode() == updated
+
+    raw_identity = await store.read_as_of(revision, identity_path(new_path))
+    assert decode_identity(
+        raw_identity,
+        virtual_path=new_path,
+        markdown=updated,
+    ) == {
+        "CIRCLEBACK_MEETING_ID": meeting_id,
+        "SOURCE": "CIRCLEBACK_WEBHOOK",
+    }
+
+
+async def test_editor_body_only_update_preserves_circleback_identity(
+    store,
+    db_session,
+    db_workspace,
+    db_user,
+    workspace_flip,
+    patched_embed_texts,
+):
+    """A body-only edit refreshes identity without moving the document."""
+    from app.knowledge_store.circleback_identity import (
+        decode_identity,
+        identity_path,
+    )
+    from app.knowledge_store.paths import to_store_path
+    from app.knowledge_store.service import (
+        record_prepared_documents,
+        record_saved_document,
+    )
+
+    workspace_flip(True)
+    meeting_id = "body-only-test-001"
+    original = "# Release Review\\n\\n**Alice** [00:03]: Draft.\\n"
+    updated = "# Release Review\\n\\n**Alice** [00:03]: Approved.\\n"
+
+    document = Document(
+        title="Release Review",
+        document_type=DocumentType.CIRCLEBACK,
+        document_metadata={"CIRCLEBACK_MEETING_ID": meeting_id},
+        content=original,
+        source_markdown=original,
+        content_hash=f"test-{uuid.uuid4().hex}",
+        unique_identifier_hash=generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        ),
+        workspace_id=db_workspace.id,
+        created_by_id=db_user.id,
+        status=DocumentStatus.ready(),
+    )
+    db_session.add(document)
+    await db_session.commit()
+
+    first_revision = await record_prepared_documents(db_session, [document])
+    assert first_revision is not None
+
+    original_path = document.path
+    assert original_path is not None
+    sidecar_path = identity_path(original_path)
+
+    previous_identity = await store.read_as_of(first_revision, sidecar_path)
+
+    revision = await record_saved_document(
+        db_session,
+        workspace_id=db_workspace.id,
+        doc_id=document.id,
+        title=document.title,
+        folder_id=document.folder_id,
+        markdown=updated,
+        author_user_id=str(db_user.id),
+        title_is_explicit=False,
+    )
+
+    assert revision is not None
+    assert document.path == original_path
+
+    paths = {item.path for item in await store.list_paths(revision)}
+    assert to_store_path(original_path) in paths
+    assert sidecar_path in paths
+
+    saved_markdown = await store.read_as_of(revision, to_store_path(original_path))
+    saved_identity = await store.read_as_of(revision, sidecar_path)
+
+    assert saved_markdown.decode() == updated
+    assert saved_identity != previous_identity
+    assert decode_identity(
+        saved_identity,
+        virtual_path=original_path,
+        markdown=updated,
+    ) == {
+        "CIRCLEBACK_MEETING_ID": meeting_id,
+        "SOURCE": "CIRCLEBACK_WEBHOOK",
+    }
+
+    # Confirm that the updated Git evidence can rebuild a lost DB row.
+    await db_session.delete(document)
+    await db_session.commit()
+
+    await index_tree(db_session, db_workspace.id)
+
+    restored = await db_session.scalar(
+        select(Document).where(
+            Document.workspace_id == db_workspace.id,
+            Document.path == original_path,
+        )
+    )
+
+    assert restored is not None
+    assert restored.document_type == DocumentType.CIRCLEBACK
+    assert restored.source_markdown == updated
+    assert restored.document_metadata["CIRCLEBACK_MEETING_ID"] == meeting_id
+    assert restored.unique_identifier_hash == (
+        generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        )
+    )
+
+
+async def test_moving_folder_relocates_circleback_identity(
+    store, db_session, db_workspace, db_user, workspace_flip
+):
+    """Moving a parent folder must update its Circleback identity."""
+    from app.knowledge_store.circleback_identity import (
+        decode_identity,
+        identity_path,
+    )
+    from app.knowledge_store.paths import to_store_path
+    from app.knowledge_store.service import record_prepared_documents
+    from app.services.folder_service import ensure_folder_hierarchy
+
+    workspace_flip(True)
+
+    folder_id = await ensure_folder_hierarchy(
+        db_session,
+        workspace_id=db_workspace.id,
+        created_by_id=str(db_user.id),
+        folder_parts=["Meetings"],
+    )
+
+    meeting_id = "folder-move-test-001"
+    markdown = "# Review\\n\\n**Alice** [00:03]: Approved.\\n"
+
+    document = Document(
+        title="Review",
+        document_type=DocumentType.CIRCLEBACK,
+        document_metadata={"CIRCLEBACK_MEETING_ID": meeting_id},
+        content=markdown,
+        source_markdown=markdown,
+        content_hash=f"test-{uuid.uuid4().hex}",
+        unique_identifier_hash=generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        ),
+        workspace_id=db_workspace.id,
+        folder_id=folder_id,
+        created_by_id=db_user.id,
+        status=DocumentStatus.ready(),
+    )
+    db_session.add(document)
+    await db_session.commit()
+
+    first = await record_prepared_documents(db_session, [document])
+    assert first is not None
+
+    old_path = document.path
+    assert old_path is not None
+    assert old_path.startswith("/documents/Meetings/")
+
+    bound_store = store.with_session(db_session).as_user(str(db_user.id))
+    outcome = await bound_store.move_folder(
+        "/documents/Meetings",
+        "/documents/Archive",
+    )
+
+    assert outcome.revision is not None
+    new_path = old_path.replace(
+        "/documents/Meetings/",
+        "/documents/Archive/",
+        1,
+    )
+
+    tracked = {entry.path for entry in await store.list_paths(outcome.revision)}
+
+    assert to_store_path(old_path) not in tracked
+    assert to_store_path(new_path) in tracked
+
+    assert identity_path(old_path) not in tracked
+    assert identity_path(new_path) in tracked
+
+    raw_identity = await store.read_as_of(
+        outcome.revision,
+        identity_path(new_path),
+    )
+
+    assert decode_identity(
+        raw_identity,
+        virtual_path=new_path,
+        markdown=markdown,
+    ) == {
+        "CIRCLEBACK_MEETING_ID": meeting_id,
+        "SOURCE": "CIRCLEBACK_WEBHOOK",
+    }
+
+
+async def test_removing_folder_cleans_circleback_identities(
+    store, db_session, db_workspace, db_user, workspace_flip
+):
+    """Deleting a folder removes meeting content and identity sidecars."""
+    from app.knowledge_store.circleback_identity import identity_path
+    from app.knowledge_store.paths import to_store_path
+    from app.knowledge_store.service import record_prepared_documents
+    from app.services.folder_service import ensure_folder_hierarchy
+
+    workspace_flip(True)
+
+    folder_id = await ensure_folder_hierarchy(
+        db_session,
+        workspace_id=db_workspace.id,
+        created_by_id=str(db_user.id),
+        folder_parts=["Old Meetings"],
+    )
+
+    meeting_id = "folder-delete-test-001"
+    markdown = "# Old Meeting\\n\\n**Alice** [00:03]: Done.\\n"
+
+    document = Document(
+        title="Old Meeting",
+        document_type=DocumentType.CIRCLEBACK,
+        document_metadata={"CIRCLEBACK_MEETING_ID": meeting_id},
+        content=markdown,
+        source_markdown=markdown,
+        content_hash=f"test-{uuid.uuid4().hex}",
+        unique_identifier_hash=generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        ),
+        workspace_id=db_workspace.id,
+        folder_id=folder_id,
+        created_by_id=db_user.id,
+        status=DocumentStatus.ready(),
+    )
+    db_session.add(document)
+    await db_session.commit()
+
+    first = await record_prepared_documents(db_session, [document])
+    assert first is not None
+
+    original_path = document.path
+    assert original_path is not None
+
+    content_path = to_store_path(original_path)
+    sidecar_path = identity_path(original_path)
+
+    before = {item.path for item in await store.list_paths(first)}
+    assert content_path in before
+    assert sidecar_path in before
+
+    bound_store = store.with_session(db_session).as_user(str(db_user.id))
+    outcome = await bound_store.remove_folder("/documents/Old Meetings")
+
+    assert outcome.revision is not None
+
+    after = {item.path for item in await store.list_paths(outcome.revision)}
+
+    assert content_path not in after
+    assert sidecar_path not in after
+
+
+async def test_mixed_folder_batch_preserves_and_cleans_meeting_identities(
+    store, db_session, db_workspace, db_user, workspace_flip
+):
+    """Two meetings and a note survive batch move without identity mixups."""
+    from app.knowledge_store.circleback_identity import (
+        decode_identity,
+        identity_path,
+    )
+    from app.knowledge_store.paths import to_store_path
+    from app.knowledge_store.service import record_prepared_documents
+    from app.services.folder_service import ensure_folder_hierarchy
+
+    workspace_flip(True)
+
+    folder_id = await ensure_folder_hierarchy(
+        db_session,
+        workspace_id=db_workspace.id,
+        created_by_id=str(db_user.id),
+        folder_parts=["Team Meetings"],
+    )
+
+    definitions = [
+        ("Sprint Planning", "mixed-meeting-001", "# Sprint Planning\\nA\\n"),
+        ("Design Review", "mixed-meeting-002", "# Design Review\\nB\\n"),
+        ("General Note", None, "# General Note\\nC\\n"),
+    ]
+    documents = []
+
+    for title, meeting_id, markdown in definitions:
+        kind = DocumentType.CIRCLEBACK if meeting_id is not None else DocumentType.NOTE
+        document = Document(
+            title=title,
+            document_type=kind,
+            document_metadata=(
+                {"CIRCLEBACK_MEETING_ID": meeting_id} if meeting_id is not None else {}
+            ),
+            content=markdown,
+            source_markdown=markdown,
+            content_hash=f"batch-{uuid.uuid4().hex}",
+            unique_identifier_hash=(
+                generate_unique_identifier_hash(
+                    DocumentType.CIRCLEBACK,
+                    f"circleback_{meeting_id}",
+                    db_workspace.id,
+                )
+                if meeting_id is not None
+                else f"batch-note-{uuid.uuid4().hex}"
+            ),
+            workspace_id=db_workspace.id,
+            folder_id=folder_id,
+            created_by_id=db_user.id,
+            status=DocumentStatus.ready(),
+        )
+        db_session.add(document)
+        documents.append(document)
+
+    await db_session.commit()
+
+    first = await record_prepared_documents(db_session, documents)
+    assert first is not None
+
+    original_paths = [doc.path for doc in documents]
+    assert all(original_paths)
+    assert len(set(original_paths)) == 3
+
+    bound_store = store.with_session(db_session).as_user(str(db_user.id))
+    moved = await bound_store.move_folder(
+        "/documents/Team Meetings",
+        "/documents/Archive",
+    )
+    assert moved.revision is not None
+
+    moved_paths = {item.path for item in await store.list_paths(moved.revision)}
+
+    new_paths = []
+
+    for (_title, meeting_id, markdown), old_path in zip(
+        definitions, original_paths, strict=True
+    ):
+        new_path = old_path.replace(
+            "/documents/Team Meetings/",
+            "/documents/Archive/",
+            1,
+        )
+        assert new_path != old_path
+        new_paths.append(new_path)
+
+        assert to_store_path(old_path) not in moved_paths
+        assert to_store_path(new_path) in moved_paths
+
+        saved = await store.read_as_of(moved.revision, to_store_path(new_path))
+        assert saved.decode() == markdown
+
+        if meeting_id is None:
+            assert identity_path(old_path) not in moved_paths
+            assert identity_path(new_path) not in moved_paths
+        else:
+            assert identity_path(old_path) not in moved_paths
+            assert identity_path(new_path) in moved_paths
+
+            raw = await store.read_as_of(moved.revision, identity_path(new_path))
+            assert (
+                decode_identity(
+                    raw,
+                    virtual_path=new_path,
+                    markdown=markdown,
+                )["CIRCLEBACK_MEETING_ID"]
+                == meeting_id
+            )
+
+    deleted = await bound_store.remove_folder("/documents/Archive")
+    assert deleted.revision is not None
+
+    remaining = {item.path for item in await store.list_paths(deleted.revision)}
+
+    for new_path in new_paths:
+        assert to_store_path(new_path) not in remaining
+        assert identity_path(new_path) not in remaining

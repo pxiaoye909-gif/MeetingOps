@@ -49,6 +49,7 @@ async def upsert_row(
     content: str,
     author_id: str,
     owned: dict[str, Document],
+    identity: dict[str, str] | None = None,
 ) -> tuple[Document, bool] | None:
     """Upsert the row for one path; ``None`` when the path names no document.
 
@@ -74,18 +75,27 @@ async def upsert_row(
     )
     created = document is None
     if document is None:
+        created_type = (
+            DocumentType.CIRCLEBACK if identity is not None else DocumentType.NOTE
+        )
+        identifier = (
+            f"circleback_{identity['CIRCLEBACK_MEETING_ID']}"
+            if identity is not None
+            else virtual_path
+        )
+
         # Agent-authored note: title is the filename without the storage .md.
         # parse_documents_path keeps that .md so it never cuts an upload's own
         # ".md" name short.
         document = Document(
             title=title.removesuffix(".md") or title,
-            document_type=DocumentType.NOTE,
-            document_metadata={},
+            document_type=created_type,
+            document_metadata=dict(identity or {}),
             path=virtual_path,
             content=content,
             content_hash=generate_content_hash(content, workspace_id),
             unique_identifier_hash=generate_unique_identifier_hash(
-                DocumentType.NOTE, virtual_path, workspace_id
+                created_type, identifier, workspace_id
             ),
             source_markdown=content,
             workspace_id=workspace_id,

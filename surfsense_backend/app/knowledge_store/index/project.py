@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Workspace
 from app.knowledge_store import KnowledgeStore
+from app.knowledge_store.circleback_identity import read_identity
 from app.knowledge_store.index.folders import reconcile_tree_folders
 from app.knowledge_store.index.rows import (
     delete_row,
@@ -155,6 +156,12 @@ async def _project(
         content = await read_indexable(store, revision, change.path)
         if content is None:
             continue
+        identity = await read_identity(
+            store,
+            revision,
+            virtual_path=virtual_path,
+            markdown=content,
+        )
         upserted = await upsert_row(
             session,
             workspace_id=workspace.id,
@@ -162,6 +169,7 @@ async def _project(
             content=content,
             author_id=author_id,
             owned=owned,
+            identity=identity,
         )
         if upserted is None:
             continue

@@ -23,6 +23,7 @@ from app.db import Document, DocumentStatus, Workspace
 from app.indexing_pipeline.connector_document import ConnectorDocument
 from app.indexing_pipeline.indexing_pipeline_service import IndexingPipelineService
 from app.knowledge_store import KnowledgeStore
+from app.knowledge_store.circleback_identity import read_identity
 from app.knowledge_store.engines.base import Change
 from app.knowledge_store.index.folders import reconcile_tree_folders
 from app.knowledge_store.index.rows import (
@@ -193,6 +194,12 @@ async def _converge(
         if content is None:
             outcome.skipped += 1
             continue
+        identity = await read_identity(
+            store,
+            head,
+            virtual_path=virtual_path,
+            markdown=content,
+        )
         ready = await _index_one(
             session,
             workspace_id=workspace.id,
@@ -200,6 +207,7 @@ async def _converge(
             content=content,
             author_id=author_id,
             owned=owned,
+            identity=identity,
         )
         if ready:
             outcome.indexed += 1
@@ -249,6 +257,7 @@ async def _index_one(
     content: str,
     author_id: str,
     owned: dict[str, Document],
+    identity: dict[str, str] | None = None,
 ) -> bool:
     """Upsert the row for one path, then index it in its own session.
 
@@ -274,6 +283,7 @@ async def _index_one(
         content=content,
         author_id=author_id,
         owned=owned,
+        identity=identity,
     )
     if upserted is None:
         return True

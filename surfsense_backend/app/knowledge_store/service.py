@@ -158,15 +158,11 @@ class KnowledgeStore:
             self._require_session(),
         )
 
-    async def push(
-        self, *, url: str, ref: str, username: str, password: str
-    ) -> str:
+    async def push(self, *, url: str, ref: str, username: str, password: str) -> str:
         """Fast-forward HEAD to ``url`` at ``ref``. Thread hop onto the engine."""
         engine = cast(GitContentEngine, self._engine)
         return await asyncio.to_thread(
-            lambda: engine.push(
-                url=url, ref=ref, username=username, password=password
-            )
+            lambda: engine.push(url=url, ref=ref, username=username, password=password)
         )
 
     def _enqueue_after_revision(self) -> None:
@@ -321,6 +317,9 @@ class KnowledgeStore:
         skip = exclude or set()
         taken: set[str] = set()
         for entry in await self.list_paths(head):
+            # Internal identity sidecars are not user documents.
+            if not entry.path.startswith("documents/"):
+                continue
             if entry.path.rsplit("/", 1)[-1] == KEEP_FILE:
                 continue
             virtual = to_virtual_path(entry.path)
@@ -448,10 +447,39 @@ class KnowledgeStore:
                     taken=taken,
                 )
             stale = _stale_store_path(previous, virtual_path)
+            files = {to_store_path(virtual_path): markdown}
+            removes = [stale] if stale else []
+
+            if document is not None:
+                from app.db import DocumentType
+                from app.knowledge_store.circleback_identity import (
+                    encode_identity,
+                    identity_path,
+                )
+
+                if document.document_type == DocumentType.CIRCLEBACK:
+                    metadata = document.document_metadata or {}
+                    meeting_id = metadata.get("CIRCLEBACK_MEETING_ID")
+                    if meeting_id is None or not str(meeting_id).strip():
+                        raise ValueError(
+                            "Cannot save Circleback meeting without meeting ID"
+                        )
+
+                    # Same-path edits refresh the content hash.
+                    # Retitles additionally remove the obsolete identity.
+                    files[identity_path(virtual_path)] = encode_identity(
+                        virtual_path=virtual_path,
+                        meeting_id=str(meeting_id),
+                        markdown=markdown,
+                    )
+
+                    if previous is not None and previous != virtual_path:
+                        removes.append(identity_path(previous))
+
             revision = await self._commit_files(
-                files={to_store_path(virtual_path): markdown},
+                files=files,
                 message=f"docs: save {_leaf(virtual_path)}",
-                removes=[stale] if stale else (),
+                removes=removes,
             )
             if revision and document is not None and previous != virtual_path:
                 document.path = virtual_path
@@ -501,6 +529,28 @@ class KnowledgeStore:
                         taken=taken,
                     )
                 files[to_store_path(virtual_path)] = doc.source_markdown
+
+                # Preserve Circleback identity alongside the Markdown in
+                # the same atomic Git revision.
+                from app.db import DocumentType
+                from app.knowledge_store.circleback_identity import (
+                    encode_identity,
+                    identity_path,
+                )
+
+                if doc.document_type == DocumentType.CIRCLEBACK:
+                    metadata = doc.document_metadata or {}
+                    meeting_id = metadata.get("CIRCLEBACK_MEETING_ID")
+                    if meeting_id is None or not str(meeting_id).strip():
+                        raise ValueError(
+                            "Circleback document is missing its meeting ID"
+                        )
+                    files[identity_path(virtual_path)] = encode_identity(
+                        virtual_path=virtual_path,
+                        meeting_id=str(meeting_id),
+                        markdown=doc.source_markdown,
+                    )
+
                 placed.append((doc, virtual_path))
             revision = await self._commit_files(
                 files=files, message=f"sync: index {len(files)} document(s)"
@@ -535,11 +585,22 @@ class KnowledgeStore:
 
         try:
             index = await build_path_index(session, self._workspace_id)
-            removes = [
-                path
-                for path in (_store_path_of(document, index) for document in documents)
-                if path is not None
-            ]
+
+            from app.db import DocumentType
+            from app.knowledge_store.circleback_identity import identity_path
+            from app.knowledge_store.paths import to_virtual_path
+
+            removes: list[str] = []
+            for document in documents:
+                store_path = _store_path_of(document, index)
+                if store_path is None:
+                    continue
+
+                removes.append(store_path)
+
+                if document.document_type == DocumentType.CIRCLEBACK:
+                    removes.append(identity_path(to_virtual_path(store_path)))
+
             revision = await self._commit_files(
                 files={}, message=_summary("delete", removes), removes=removes
             )
@@ -579,18 +640,57 @@ class KnowledgeStore:
                 if (p := recorded_virtual_path(d.document_metadata, d.path)) is not None
             }
             taken = await self._taken_virtual_paths(exclude=own)
+            from app.db import DocumentType
+            from app.knowledge_store.circleback_identity import (
+                encode_identity,
+                identity_path,
+            )
+            from app.knowledge_store.paths import to_virtual_path
+
             moves: list[tuple[str, str]] = []
             moved: list[tuple[Document, str]] = []
+            files: dict[str, str] = {}
+            removes: list[str] = []
+
             for document in documents:
                 relocation = _relocation_of(document, index, taken)
                 if relocation is None:
                     continue
+
                 source, destination, virtual_path = relocation
                 moves.append((source, destination))
                 moved.append((document, virtual_path))
+
+                if document.document_type == DocumentType.CIRCLEBACK:
+                    metadata = document.document_metadata or {}
+                    meeting_id = metadata.get("CIRCLEBACK_MEETING_ID")
+                    if meeting_id is None or not str(meeting_id).strip():
+                        raise ValueError(
+                            "Cannot move Circleback meeting without meeting ID"
+                        )
+
+                    head = await self.head()
+                    if head is None:
+                        raise ValueError(
+                            "Cannot move Circleback meeting without Git revision"
+                        )
+
+                    # Use exactly the content being moved in Git.
+                    markdown = (await self.read_as_of(head, source)).decode("utf-8")
+
+                    old_virtual_path = to_virtual_path(source)
+                    removes.append(identity_path(old_virtual_path))
+
+                    files[identity_path(virtual_path)] = encode_identity(
+                        virtual_path=virtual_path,
+                        meeting_id=str(meeting_id),
+                        markdown=markdown,
+                    )
+
             revision = await self._commit_files(
-                files={},
+                files=files,
                 message=_summary("move", [dst for _, dst in moves]),
+                removes=removes,
                 moves=moves,
             )
             if revision:
@@ -623,9 +723,31 @@ class KnowledgeStore:
         """Remove a folder and everything under it in one revision."""
         if not await knowledge_store_enabled_for(self._workspace_id):
             return Outcome(revision=None)
+        from app.knowledge_store.circleback_identity import identity_path
+        from app.knowledge_store.paths import to_virtual_path
+
+        removes = await self._subtree_paths(path)
+
+        # Circleback identities live outside the documents/ subtree.
+        # Delete only identity files that actually exist in this Git revision.
+        head = await self.head()
+        tracked = (
+            {entry.path for entry in await self.list_paths(head)}
+            if head is not None
+            else set()
+        )
+
+        for store_path in list(removes):
+            if not store_path.endswith(".md"):
+                continue
+
+            sidecar = identity_path(to_virtual_path(store_path))
+            if sidecar in tracked:
+                removes.append(sidecar)
+
         revision = await self._commit_files(
             files={},
-            removes=await self._subtree_paths(path),
+            removes=removes,
             message=f"docs: delete folder {_leaf(path)}",
         )
         await self._reconcile_folders(revision)
@@ -662,11 +784,65 @@ class KnowledgeStore:
             return Outcome(revision=None)
         src = self._folder_store_path(source)
         dst = self._folder_store_path(destination)
+        from app.knowledge_store.circleback_identity import (
+            decode_identity,
+            encode_identity,
+            identity_path,
+        )
+        from app.knowledge_store.paths import KEEP_FILE, to_virtual_path
+
+        head = await self.head()
+        tracked = (
+            {entry.path for entry in await self.list_paths(head)}
+            if head is not None
+            else set()
+        )
+
         moves = [
             (p, f"{dst}{p[len(src) :]}") for p in await self._subtree_paths(source)
         ]
+        files: dict[str, str] = {}
+        removes: list[str] = []
+
+        for old_store_path, new_store_path in moves:
+            if old_store_path.rsplit("/", 1)[-1] == KEEP_FILE:
+                continue
+
+            old_virtual = to_virtual_path(old_store_path)
+            old_identity = identity_path(old_virtual)
+
+            # Ordinary documents have no Circleback identity sidecar.
+            if old_identity not in tracked:
+                continue
+
+            if head is None:
+                raise ValueError("Missing Git revision for folder move")
+
+            raw_markdown = await self.read_as_of(head, old_store_path)
+            markdown = raw_markdown.decode("utf-8")
+            raw_identity = await self.read_as_of(head, old_identity)
+
+            identity = decode_identity(
+                raw_identity,
+                virtual_path=old_virtual,
+                markdown=markdown,
+            )
+            if identity is None:
+                raise ValueError(f"Invalid Circleback identity for {old_virtual}")
+
+            new_virtual = to_virtual_path(new_store_path)
+            files[identity_path(new_virtual)] = encode_identity(
+                virtual_path=new_virtual,
+                meeting_id=identity["CIRCLEBACK_MEETING_ID"],
+                markdown=markdown,
+            )
+            removes.append(old_identity)
+
         revision = await self._commit_files(
-            files={}, moves=moves, message=f"docs: move folder {_leaf(destination)}"
+            files=files,
+            moves=moves,
+            removes=removes,
+            message=f"docs: move folder {_leaf(destination)}",
         )
         # Rename the row in place before reconcile, so its id survives the move;
         # reconcile then finds it already at the live chain and leaves it be.
