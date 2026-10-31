@@ -1408,3 +1408,642 @@ async def test_mixed_folder_batch_preserves_and_cleans_meeting_identities(
     for new_path in new_paths:
         assert to_store_path(new_path) not in remaining
         assert identity_path(new_path) not in remaining
+
+
+async def test_circleback_replay_after_git_restore_reuses_document(
+    store,
+    db_session,
+    db_workspace,
+    db_user,
+    workspace_flip,
+    patched_embed_texts,
+):
+    """A replay after Git recovery must reuse the restored document."""
+    from app.knowledge_store.service import record_prepared_documents
+    from app.tasks.document_processors.circleback_processor import (
+        add_circleback_meeting_document,
+    )
+    from app.utils.document_converters import generate_content_hash
+
+    workspace_flip(True)
+
+    meeting_id = "replay-after-restore-001"
+    markdown = "# Release Review\\n\\nAlice: Approved.\\n"
+
+    original = Document(
+        title="Release Review",
+        document_type=DocumentType.CIRCLEBACK,
+        document_metadata={
+            "CIRCLEBACK_MEETING_ID": meeting_id,
+            "SOURCE": "CIRCLEBACK_WEBHOOK",
+        },
+        content=markdown,
+        source_markdown=markdown,
+        content_hash=generate_content_hash(markdown, db_workspace.id),
+        unique_identifier_hash=generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        ),
+        workspace_id=db_workspace.id,
+        created_by_id=db_user.id,
+        status=DocumentStatus.ready(),
+    )
+    db_session.add(original)
+    await db_session.commit()
+
+    revision = await record_prepared_documents(db_session, [original])
+    assert revision is not None
+
+    original_path = original.path
+    assert original_path is not None
+
+    # Simulate loss of the PostgreSQL document, not the Git content.
+    await db_session.delete(original)
+    await db_session.commit()
+
+    await index_tree(db_session, db_workspace.id)
+
+    restored = await db_session.scalar(
+        select(Document).where(
+            Document.workspace_id == db_workspace.id,
+            Document.path == original_path,
+        )
+    )
+    assert restored is not None
+    assert restored.document_type == DocumentType.CIRCLEBACK
+    restored_id = restored.id
+
+    # Simulate receiving exactly the same meeting again.
+    replayed = await add_circleback_meeting_document(
+        session=db_session,
+        meeting_id=meeting_id,
+        meeting_name="Release Review",
+        markdown_content=markdown,
+        metadata={},
+        workspace_id=db_workspace.id,
+    )
+
+    assert replayed is not None
+    assert replayed.id == restored_id
+    assert replayed.document_type == DocumentType.CIRCLEBACK
+
+    count = await db_session.scalar(
+        select(func.count(Document.id)).where(
+            Document.workspace_id == db_workspace.id,
+            Document.document_type == DocumentType.CIRCLEBACK,
+        )
+    )
+    assert count == 1
+
+    assert replayed.unique_identifier_hash == (
+        generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        )
+    )
+
+
+async def test_circleback_changed_replay_after_restore_updates_existing_document(
+    store,
+    db_session,
+    db_workspace,
+    db_user,
+    workspace_flip,
+    patched_embed_texts,
+    monkeypatch,
+):
+    """Changed replay updates the restored meeting without duplication."""
+    from app.knowledge_store.circleback_identity import (
+        decode_identity,
+        identity_path,
+    )
+    from app.knowledge_store.paths import to_store_path
+    from app.knowledge_store.service import record_prepared_documents
+    from app.tasks.document_processors import circleback_processor
+    from app.utils.document_converters import generate_content_hash
+
+    workspace_flip(True)
+
+    meeting_id = "replay-changed-after-restore-001"
+    original_text = "# Release Review\\n\\nAlice: Pending.\\n"
+    updated_text = "# Release Review\\n\\nAlice: Approved.\\n"
+
+    original = Document(
+        title="Release Review",
+        document_type=DocumentType.CIRCLEBACK,
+        document_metadata={
+            "CIRCLEBACK_MEETING_ID": meeting_id,
+            "SOURCE": "CIRCLEBACK_WEBHOOK",
+        },
+        content=original_text,
+        source_markdown=original_text,
+        content_hash=generate_content_hash(original_text, db_workspace.id),
+        unique_identifier_hash=generate_unique_identifier_hash(
+            DocumentType.CIRCLEBACK,
+            f"circleback_{meeting_id}",
+            db_workspace.id,
+        ),
+        workspace_id=db_workspace.id,
+        created_by_id=db_user.id,
+        status=DocumentStatus.ready(),
+    )
+    db_session.add(original)
+    await db_session.commit()
+
+    first = await record_prepared_documents(db_session, [original])
+    assert first is not None
+    old_path = original.path
+    assert old_path is not None
+
+    await db_session.delete(original)
+    await db_session.commit()
+    await index_tree(db_session, db_workspace.id)
+
+    restored = await db_session.scalar(
+        select(Document).where(
+            Document.workspace_id == db_workspace.id,
+            Document.path == old_path,
+        )
+    )
+    assert restored is not None
+    restored_id = restored.id
+
+    # Isolate the persistence behavior from model inference.
+    monkeypatch.setattr(circleback_processor, "embed_text", lambda _text: None)
+
+    async def fake_chunks(_markdown):
+        return []
+
+    monkeypatch.setattr(
+        circleback_processor,
+        "create_circleback_document_chunks",
+        fake_chunks,
+    )
+
+    replayed = await circleback_processor.add_circleback_meeting_document(
+        session=db_session,
+        meeting_id=meeting_id,
+        meeting_name="Release Review",
+        markdown_content=updated_text,
+        metadata={},
+        workspace_id=db_workspace.id,
+    )
+
+    assert replayed is not None
+    assert replayed.id == restored_id
+    assert replayed.document_type == DocumentType.CIRCLEBACK
+    assert replayed.source_markdown == updated_text
+    assert replayed.content_hash == generate_content_hash(updated_text, db_workspace.id)
+
+    count = await db_session.scalar(
+        select(func.count(Document.id)).where(
+            Document.workspace_id == db_workspace.id,
+            Document.document_type == DocumentType.CIRCLEBACK,
+        )
+    )
+    assert count == 1
+
+    head = await store.head()
+    assert head is not None
+
+    new_path = replayed.path
+    assert new_path is not None
+
+    markdown = await store.read_as_of(head, to_store_path(new_path))
+    identity = await store.read_as_of(head, identity_path(new_path))
+
+    assert markdown.decode() == updated_text
+    assert decode_identity(
+        identity,
+        virtual_path=new_path,
+        markdown=updated_text,
+    ) == {
+        "CIRCLEBACK_MEETING_ID": meeting_id,
+        "SOURCE": "CIRCLEBACK_WEBHOOK",
+    }
+
+    tracked = {entry.path for entry in await store.list_paths(head)}
+    assert (
+        len([p for p in tracked if p.startswith("documents/") and p.endswith(".md")])
+        == 1
+    )
+
+
+async def test_circleback_distinct_meeting_ids_with_identical_content(
+    store,
+    db_session,
+    db_workspace,
+    workspace_flip,
+    monkeypatch,
+):
+    """Identical content must not merge meetings with different source IDs."""
+    from app.knowledge_store.circleback_identity import (
+        decode_identity,
+        identity_path,
+    )
+    from app.knowledge_store.paths import to_store_path
+    from app.tasks.document_processors import circleback_processor
+
+    workspace_flip(True)
+
+    markdown = "# Shared meeting template\n\nAlice: Confirmed.\n"
+
+    monkeypatch.setattr(circleback_processor, "embed_text", lambda _text: None)
+
+    async def fake_chunks(_markdown):
+        return []
+
+    monkeypatch.setattr(
+        circleback_processor,
+        "create_circleback_document_chunks",
+        fake_chunks,
+    )
+
+    meeting_specs = [
+        ("meeting-alpha-001", "Alpha Review"),
+        ("meeting-beta-002", "Beta Review"),
+    ]
+
+    documents = []
+
+    for meeting_id, meeting_name in meeting_specs:
+        document = await circleback_processor.add_circleback_meeting_document(
+            session=db_session,
+            meeting_id=meeting_id,
+            meeting_name=meeting_name,
+            markdown_content=markdown,
+            metadata={},
+            workspace_id=db_workspace.id,
+        )
+        assert document is not None
+        documents.append(document)
+
+    assert documents[0].id != documents[1].id
+    assert documents[0].path != documents[1].path
+    assert documents[0].content_hash == documents[1].content_hash
+    assert documents[0].unique_identifier_hash != documents[1].unique_identifier_hash
+
+    count = await db_session.scalar(
+        select(func.count(Document.id)).where(
+            Document.workspace_id == db_workspace.id,
+            Document.document_type == DocumentType.CIRCLEBACK,
+        )
+    )
+    assert count == 2
+
+    revision = await store.head()
+    assert revision is not None
+
+    tracked = {entry.path for entry in await store.list_paths(revision)}
+
+    for document, (meeting_id, _) in zip(documents, meeting_specs, strict=True):
+        assert document.path is not None
+
+        markdown_path = to_store_path(document.path)
+        sidecar_path = identity_path(document.path)
+
+        assert markdown_path in tracked
+        assert sidecar_path in tracked
+
+        saved = await store.read_as_of(revision, markdown_path)
+        raw_identity = await store.read_as_of(revision, sidecar_path)
+
+        assert saved.decode() == markdown
+        assert (
+            decode_identity(
+                raw_identity,
+                virtual_path=document.path,
+                markdown=markdown,
+            )["CIRCLEBACK_MEETING_ID"]
+            == meeting_id
+        )
+
+
+async def test_circleback_same_meeting_id_isolated_across_workspaces(
+    knowledge_root,
+    db_session,
+    db_workspace,
+    db_user,
+    workspace_flip,
+    monkeypatch,
+):
+    """Identical meeting IDs in different workspaces remain independent."""
+    from app.db import Workspace
+    from app.knowledge_store import KnowledgeStore
+    from app.knowledge_store.circleback_identity import (
+        decode_identity,
+        identity_path,
+    )
+    from app.knowledge_store.paths import to_store_path
+    from app.tasks.document_processors import circleback_processor
+
+    workspace_flip(True)
+
+    second_workspace = Workspace(
+        name="Second Test Workspace",
+        user_id=db_user.id,
+    )
+    db_session.add(second_workspace)
+    await db_session.flush()
+
+    monkeypatch.setattr(
+        circleback_processor,
+        "embed_text",
+        lambda _text: None,
+    )
+
+    async def fake_chunks(_markdown):
+        return []
+
+    monkeypatch.setattr(
+        circleback_processor,
+        "create_circleback_document_chunks",
+        fake_chunks,
+    )
+
+    meeting_id = "shared-meeting-001"
+    markdown = "# Shared Review\n\nAlice: Approved.\n"
+
+    documents = []
+
+    for workspace in [db_workspace, second_workspace]:
+        document = await circleback_processor.add_circleback_meeting_document(
+            session=db_session,
+            meeting_id=meeting_id,
+            meeting_name="Shared Review",
+            markdown_content=markdown,
+            metadata={},
+            workspace_id=workspace.id,
+        )
+        assert document is not None
+        assert document.workspace_id == workspace.id
+        documents.append(document)
+
+    first, second = documents
+
+    assert first.id != second.id
+    assert first.unique_identifier_hash != second.unique_identifier_hash
+
+    for workspace, document in zip(
+        [db_workspace, second_workspace], documents, strict=True
+    ):
+        count = await db_session.scalar(
+            select(func.count(Document.id)).where(
+                Document.workspace_id == workspace.id,
+                Document.document_type == DocumentType.CIRCLEBACK,
+            )
+        )
+        assert count == 1
+
+        assert document.path is not None
+        knowledge_store = KnowledgeStore.for_workspace(workspace.id)
+        head = await knowledge_store.head()
+        assert head is not None
+
+        tracked = {entry.path for entry in await knowledge_store.list_paths(head)}
+
+        assert to_store_path(document.path) in tracked
+        assert identity_path(document.path) in tracked
+
+        saved = await knowledge_store.read_as_of(
+            head,
+            to_store_path(document.path),
+        )
+        raw_identity = await knowledge_store.read_as_of(
+            head,
+            identity_path(document.path),
+        )
+
+        assert saved.decode() == markdown
+        assert (
+            decode_identity(
+                raw_identity,
+                virtual_path=document.path,
+                markdown=markdown,
+            )["CIRCLEBACK_MEETING_ID"]
+            == meeting_id
+        )
+
+    # Replaying in workspace A must not change or duplicate workspace B.
+    replayed = await circleback_processor.add_circleback_meeting_document(
+        session=db_session,
+        meeting_id=meeting_id,
+        meeting_name="Shared Review",
+        markdown_content=markdown,
+        metadata={},
+        workspace_id=db_workspace.id,
+    )
+
+    assert replayed is not None
+    assert replayed.id == first.id
+    assert second.workspace_id == second_workspace.id
+
+    total = await db_session.scalar(
+        select(func.count(Document.id)).where(
+            Document.document_type == DocumentType.CIRCLEBACK,
+            Document.workspace_id.in_([db_workspace.id, second_workspace.id]),
+        )
+    )
+    assert total == 2
+
+
+async def test_circleback_http_replay_after_redis_expiry_keeps_one_document(
+    store,
+    db_session,
+    db_workspace,
+    workspace_flip,
+    monkeypatch,
+):
+    """Repeated HTTP delivery must result in one durable meeting."""
+    import hashlib
+    import hmac
+    import json
+
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from app.db import get_async_session
+    from app.knowledge_store.circleback_identity import (
+        decode_identity,
+        identity_path,
+    )
+    from app.knowledge_store.paths import to_store_path
+    from app.routes import circleback_webhook_idempotency
+    from app.routes.circleback_webhook_route import router
+    from app.tasks.celery_tasks.document_tasks import (
+        process_circleback_meeting_task,
+    )
+    from app.tasks.document_processors import circleback_processor
+
+    workspace_flip(True)
+
+    workspace_id = db_workspace.id
+    meeting_id = "http-redis-replay-001"
+    secret = "integration-test-secret"
+
+    monkeypatch.setenv(
+        "MEETINGOPS_CIRCLEBACK_SIGNING_SECRETS",
+        json.dumps({str(workspace_id): secret}),
+    )
+
+    # Fake only the external Redis service; use the real dedup logic.
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+
+        def set(self, key, value, *, nx=False, ex=None):
+            if nx and key in self.values:
+                return None
+            self.values[key] = value
+            return True
+
+        def eval(self, script, numkeys, key, token):
+            if self.values.get(key) == token:
+                del self.values[key]
+                return 1
+            return 0
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(
+        circleback_webhook_idempotency,
+        "_client",
+        lambda: fake_redis,
+    )
+
+    # Capture Celery submissions; run the real processor below.
+    queued_tasks = []
+
+    def capture_task(**kwargs):
+        queued_tasks.append(kwargs)
+
+    monkeypatch.setattr(
+        process_circleback_meeting_task,
+        "delay",
+        capture_task,
+    )
+
+    # Avoid an external embedding model during this integration test.
+    dimension = app_config.embedding_model_instance.dimension
+    monkeypatch.setattr(
+        circleback_processor,
+        "embed_text",
+        lambda _text: [0.1] * dimension,
+    )
+
+    async def fake_chunks(_markdown):
+        return []
+
+    monkeypatch.setattr(
+        circleback_processor,
+        "create_circleback_document_chunks",
+        fake_chunks,
+    )
+
+    async def override_session():
+        yield db_session
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_async_session] = override_session
+
+    body = json.dumps(
+        {
+            "id": meeting_id,
+            "name": "Project Review",
+            "createdAt": "2026-10-31T10:00:00Z",
+            "duration": 1800,
+            "notes": "The release plan is approved.",
+        }
+    ).encode("utf-8")
+
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-signature": signature,
+    }
+    url = f"/webhooks/circleback/{workspace_id}"
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        first = await client.post(url, content=body, headers=headers)
+        duplicate = await client.post(url, content=body, headers=headers)
+
+        assert first.status_code == 200, first.text
+        assert first.json()["status"] == "accepted"
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["status"] == "duplicate"
+        assert len(queued_tasks) == 1
+
+        # Simulate expiry of the Redis delivery claim.
+        fake_redis.values.clear()
+
+        replay = await client.post(url, content=body, headers=headers)
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["status"] == "accepted"
+    assert len(queued_tasks) == 2
+
+    # Simulate workers consuming both queued tasks using the
+    # real business processor and real PostgreSQL session.
+    saved_ids = []
+
+    for kwargs in queued_tasks:
+        document = await circleback_processor.add_circleback_meeting_document(
+            session=db_session,
+            **kwargs,
+        )
+        assert document is not None
+        saved_ids.append(document.id)
+
+        if len(saved_ids) == 1:
+            first_revision = await store.head()
+            assert first_revision is not None
+
+    assert saved_ids[0] == saved_ids[1]
+
+    documents = (
+        await db_session.scalars(
+            select(Document).where(
+                Document.workspace_id == workspace_id,
+                Document.document_type == DocumentType.CIRCLEBACK,
+            )
+        )
+    ).all()
+
+    assert len(documents) == 1
+
+    saved_document = documents[0]
+    assert saved_document.id == saved_ids[0]
+    assert saved_document.path is not None
+    assert saved_document.document_metadata["CIRCLEBACK_MEETING_ID"] == meeting_id
+
+    # A same-content replay must not create another Git revision.
+    final_revision = await store.head()
+    assert final_revision == first_revision
+
+    markdown = await store.read_as_of(
+        final_revision,
+        to_store_path(saved_document.path),
+    )
+    assert markdown.decode() == saved_document.source_markdown
+
+    raw_identity = await store.read_as_of(
+        final_revision,
+        identity_path(saved_document.path),
+    )
+    identity = decode_identity(
+        raw_identity,
+        virtual_path=saved_document.path,
+        markdown=markdown.decode(),
+    )
+    assert identity is not None
+    assert identity["CIRCLEBACK_MEETING_ID"] == meeting_id

@@ -454,7 +454,38 @@ def test_signed_string_meeting_id_reaches_celery(
 
     queued.assert_called_once()
     assert queued.call_args.kwargs["meeting_id"] == meeting_id
-    assert (
-        queued.call_args.kwargs["metadata"]["circleback_meeting_id"]
-        == meeting_id
+    assert queued.call_args.kwargs["metadata"]["circleback_meeting_id"] == meeting_id
+
+
+def test_expired_delivery_claim_allows_requeue(
+    monkeypatch,
+    configured_secrets,
+    fake_delivery_redis,
+):
+    """Redis dedup expiry permits a later delivery to reach Celery."""
+    queued = Mock()
+    monkeypatch.setattr(
+        process_circleback_meeting_task,
+        "delay",
+        queued,
     )
+
+    with _build_signed_webhook_test_client() as client:
+        first = _post_signed(client, "meeting-expiry-001")
+        duplicate = _post_signed(client, "meeting-expiry-001")
+
+        assert first.status_code == 200
+        assert first.json()["status"] == "accepted"
+        assert duplicate.status_code == 200
+        assert duplicate.json()["status"] == "duplicate"
+        assert queued.call_count == 1
+
+        # Simulate Redis removing the claim after its 300-second TTL.
+        # This fake does not implement real-time expiry.
+        fake_delivery_redis.values.clear()
+
+        replay = _post_signed(client, "meeting-expiry-001")
+
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "accepted"
+    assert queued.call_count == 2
